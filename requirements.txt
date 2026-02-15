@@ -8,9 +8,11 @@ jinja2>=3.1.0
 google-genai>=1.0.0
 openai>=1.30.0
 anthropic>=0.34.0
+groq>=0.4.0
 
 # Image processing
 Pillow>=10.0.0
+# easyocr removed — vision-based label placement replaces OCR entirely
 
 # SVG manipulation (for annotator/refiner)
 # svgpathtools already installed in svgrender env

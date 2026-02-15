@@ -87,7 +87,7 @@ _INTENT_PATTERNS: list[tuple[str, str]] = [
 REFINE_CLASSIFY_PROMPT = """Classify this refinement request for a medical diagram into ONE action:
 
 Actions:
-- "style_change": change annotation visual style (numbered, textbook, plain, boxed, color_coded, minimal)
+- "style_change": change annotation visual style (professional, numbered, textbook, plain, boxed, color_coded, minimal)
 - "label_edit": rename/fix specific label text
 - "add_label": add a new label
 - "remove_label": remove a label
@@ -266,12 +266,17 @@ class RefineSession:
         with Image.open(raster_path) as img:
             w, h = img.size
 
+        # Professional style uses balanced left/right distribution
+        effective_label_side = self.plan.get("label_side", "right")
+        if style == "professional":
+            effective_label_side = "integrated"
+
         # Recompute layout in case labels changed
         label_positions = compute_label_layout(
             points=self.label_positions,
             image_width=w,
             image_height=h,
-            label_side=self.plan.get("label_side", "right"),
+            label_side=effective_label_side,
         )
         self.label_positions = label_positions
 
@@ -280,6 +285,7 @@ class RefineSession:
             label_positions=label_positions,
             style=style,  # type: ignore[arg-type]
             session_id=self.session_id,
+            cover_placeholders=False,  # Clean images: no placeholders to cover
         )
         svg_path = render_labels_as_svg(
             image_path=raster_path,
@@ -314,7 +320,9 @@ def _classify_request(request: str, labels: list[str], style: str) -> dict:
         style=style,
     )
 
-    if LLM_PROVIDER == "gemini":
+    # Groq is only for prompt enhancement; refiner uses gemini or openai
+    provider = "gemini" if LLM_PROVIDER == "groq" else LLM_PROVIDER
+    if provider == "gemini":
         text = _llm_gemini(prompt)
     else:
         text = _llm_openai(prompt)
@@ -352,6 +360,9 @@ def _extract_style_name(request: str) -> str | None:
         "color_coded": "color_coded",
         "color coded": "color_coded",
         "minimal": "minimal",
+        "professional": "professional",
+        "pro": "professional",
+        "clean": "professional",
     }
     for keyword, style_name in style_map.items():
         if keyword in text:

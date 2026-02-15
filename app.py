@@ -1,10 +1,10 @@
 """
 Medical Figure Generator - FastAPI Chat Server
-Orchestrates the 4-stage pipeline:
-  1. Diagram Planner (LLM)
-  2. Image Generator (API)
-  3. Vision Label Placer (Vision API)
-  4. Label Renderer (Pillow/SVG)
+Orchestrates the generation flow:
+  1. Diagram Planner (LLM) — user prompt → structured plan (drawing_prompt, labels)
+  2. Image Generator (API) — enhanced prompt → clean base image (NO text/numbers)
+  3. Vision Label Placer — three-pass zone classification locates each structure
+  4. Label Renderer (Pillow/SVG) — overlay labels with leader lines
 """
 
 import uuid
@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from config import GENERATED_DIR, PROJECT_ROOT, DEFAULT_LABEL_STYLE
-from pipeline.diagram_planner import create_plan
+from pipeline.diagram_planner import enhance_prompt, create_plan
 from pipeline.image_generator import generate_image
 from pipeline.vision_label_placer import locate_labels
 from pipeline.label_renderer import (
@@ -63,17 +63,14 @@ async def generate(request: Request):
     steps_completed: list[dict] = []
 
     try:
-        # ── Stage 1: Diagram Planner ──────────────────────────
+        # ── Stage 1: Full diagram plan (drawing_prompt, labels, description) for precise label placement ──
         plan = create_plan(message, provider=llm_provider)
         steps_completed.append({
             "stage": "diagram_planner",
-            "result": {
-                "labels": len(plan.get("labels", [])),
-                "type": plan.get("diagram_type"),
-            },
+            "result": f"Plan ready with {len(plan.get('labels', []))} labels",
         })
 
-        # ── Stage 2: Generate raster image ───────────────────
+        # ── Stage 2: Generate base image (no labels on image) ───────────────────
         raster_path = generate_image(plan, session_id, provider=image_provider)
         raster_url = f"/generated/{session_id}/raster.png"
         steps_completed.append({
@@ -85,53 +82,75 @@ async def generate(request: Request):
         svg_url = None
         label_positions: list[dict] = []
 
-        if not skip_annotate and plan.get("labels"):
-            # ── Stage 3: Vision Label Placer ──────────────────
-            points = locate_labels(
-                image_path=raster_path,
-                labels=plan["labels"],
-                description=plan.get("description", "medical diagram"),
-                provider=llm_provider,
-            )
-            steps_completed.append({
-                "stage": "vision_label_placer",
-                "result": f"Located {len(points)} labels",
-            })
+        if not skip_annotate:
+            # ── Stage 3: Vision-based label placement ──
+            # Uses two-pass approach: direct coordinate detection + visual
+            # verification for accurate structure localisation
+            labels_from_plan = plan.get("labels") or []
+            description = plan.get("description", "")
+            if labels_from_plan:
+                points = locate_labels(
+                    image_path=raster_path,
+                    labels=labels_from_plan,
+                    description=description,
+                    provider=llm_provider,
+                )
+                steps_completed.append({
+                    "stage": "vision_label_placer",
+                    "result": f"Located {len(points)} structures via vision analysis",
+                })
+            else:
+                points = []
+                steps_completed.append({
+                    "stage": "vision_label_placer",
+                    "result": "No labels in plan, skipping annotation",
+                })
 
-            # ── Stage 4: Label Renderer ───────────────────────
-            from PIL import Image
-            with Image.open(raster_path) as img:
-                w, h = img.size
+            if points:
+                # ── Stage 4: Overlay labels onto image using returned coordinates ──
+                from PIL import Image
+                with Image.open(raster_path) as img:
+                    w, h = img.size
 
-            label_positions = compute_label_layout(
-                points=points,
-                image_width=w,
-                image_height=h,
-                label_side=plan.get("label_side", "right"),
-            )
+                # Professional style uses balanced left/right distribution
+                effective_label_side = plan.get("label_side", "right")
+                if label_style == "professional":
+                    effective_label_side = "integrated"
 
-            # Render annotated PNG
-            annotated_png_path = render_labels_on_png(
-                image_path=raster_path,
-                label_positions=label_positions,
-                style=label_style,  # type: ignore[arg-type]
-                session_id=session_id,
-            )
-            annotated_png_url = f"/generated/{session_id}/annotated.png"
+                label_positions = compute_label_layout(
+                    points=points,
+                    image_width=w,
+                    image_height=h,
+                    label_side=effective_label_side,
+                )
 
-            # Render annotated SVG
-            svg_path = render_labels_as_svg(
-                image_path=raster_path,
-                label_positions=label_positions,
-                style=label_style,  # type: ignore[arg-type]
-                session_id=session_id,
-            )
-            svg_url = f"/generated/{session_id}/annotated.svg"
+                render_labels_on_png(
+                    image_path=raster_path,
+                    label_positions=label_positions,
+                    style=label_style,  # type: ignore[arg-type]
+                    session_id=session_id,
+                    cover_placeholders=False,  # Clean images: no placeholders
+                )
+                annotated_png_url = f"/generated/{session_id}/annotated.png"
 
-            steps_completed.append({
-                "stage": "label_renderer",
-                "result": f"{label_style} style, {len(label_positions)} labels",
-            })
+                render_labels_as_svg(
+                    image_path=raster_path,
+                    label_positions=label_positions,
+                    style=label_style,  # type: ignore[arg-type]
+                    session_id=session_id,
+                )
+                svg_url = f"/generated/{session_id}/annotated.svg"
+
+                steps_completed.append({
+                    "stage": "label_renderer",
+                    "result": f"{label_style} style, {len(label_positions)} labels",
+                })
+
+        # Build plan for session/refiner: labels come from vision response
+        plan["labels"] = [p["label"] for p in label_positions]
+        plan["label_side"] = plan.get("label_side", "right")
+        plan["style"] = plan.get("style", "colored_diagram")
+        plan["diagram_type"] = plan.get("diagram_type", "anatomy")
 
         # ── Store session for refinement ──────────────────────
         sessions[session_id] = {
@@ -150,6 +169,7 @@ async def generate(request: Request):
             "raster_url": raster_url,
             "annotated_url": annotated_png_url,
             "svg_url": svg_url,
+            "enhanced_prompt": plan.get("drawing_prompt", ""),
             "plan": {
                 "labels": plan.get("labels", []),
                 "description": plan.get("description", ""),
@@ -202,48 +222,72 @@ async def refine(request: Request):
             vision_provider = llm_provider or session.get("llm_provider")
 
             if result.get("action") == "regenerate":
-                # Full regeneration: re-plan + re-generate image
+                # Full regeneration: plan → image → vision locate → render
                 refinement_req = new_plan.pop("_refinement_request", message)
                 combined_prompt = (
                     session["plan"].get("description", "")
                     + ". " + refinement_req
                 )
-                print(f"[app] Re-running planner for: {combined_prompt[:80]}...")
+                print(f"[app] Re-running diagram planner for: {combined_prompt[:80]}...")
                 new_plan = create_plan(combined_prompt, provider=vision_provider)
-                print(f"[app] New plan: {len(new_plan.get('labels', []))} labels")
 
                 raster_path = generate_image(
                     new_plan, session_id, provider=img_provider
                 )
                 raster_url = f"/generated/{session_id}/raster.png"
+
+                labels_from_plan = new_plan.get("labels") or []
+                description = new_plan.get("description", "")
+                points = locate_labels(
+                    image_path=raster_path,
+                    labels=labels_from_plan,
+                    description=description,
+                    provider=vision_provider,
+                )
+                new_plan["labels"] = [p["label"] for p in points]
+                new_plan["label_side"] = new_plan.get("label_side", "right")
             elif result.get("needs_vision_rerun"):
-                # Re-run vision placer on existing image (reposition / add_label)
+                # Re-run vision label placer on existing image (reposition / add_label)
                 raster_path = session["raster_path"]
                 raster_url = f"/generated/{session_id}/raster.png"
+                description = new_plan.get("description", "")
+                points = locate_labels(
+                    image_path=raster_path,
+                    labels=new_plan.get("labels", []),
+                    description=description,
+                    provider=vision_provider,
+                )
             else:
                 raster_path = generate_image(
                     new_plan, session_id, provider=img_provider
                 )
                 raster_url = f"/generated/{session_id}/raster.png"
-
-            # Re-run vision placer + renderer
-            points = locate_labels(
-                image_path=raster_path,
-                labels=new_plan.get("labels", []),
-                description=new_plan.get("description", "medical diagram"),
-                provider=vision_provider,
-            )
+                labels_from_plan = new_plan.get("labels") or []
+                description = new_plan.get("description", "")
+                points = locate_labels(
+                    image_path=raster_path,
+                    labels=labels_from_plan,
+                    description=description,
+                    provider=vision_provider,
+                )
+                new_plan["labels"] = [p["label"] for p in points]
+                new_plan["label_side"] = new_plan.get("label_side", "right")
 
             from PIL import Image
             with Image.open(raster_path) as img:
                 w, h = img.size
 
             style = new_style or session["label_style"]
+            # Professional style uses balanced left/right distribution
+            effective_label_side = new_plan.get("label_side", "right")
+            if style == "professional":
+                effective_label_side = "integrated"
+
             label_positions = compute_label_layout(
                 points=points,
                 image_width=w,
                 image_height=h,
-                label_side=new_plan.get("label_side", "right"),
+                label_side=effective_label_side,
             )
 
             render_labels_on_png(
@@ -251,6 +295,7 @@ async def refine(request: Request):
                 label_positions=label_positions,
                 style=style,  # type: ignore[arg-type]
                 session_id=session_id,
+                cover_placeholders=False,  # Clean images: no placeholders
             )
             render_labels_as_svg(
                 image_path=raster_path,
@@ -268,14 +313,17 @@ async def refine(request: Request):
             refiner.label_positions = label_positions
             refiner.label_style = style
 
-            return JSONResponse({
+            resp = {
                 "session_id": session_id,
                 "action": "regenerated",
                 "explanation": result["explanation"],
                 "raster_url": raster_url,
                 "annotated_url": f"/generated/{session_id}/annotated.png",
                 "svg_url": f"/generated/{session_id}/annotated.svg",
-            })
+            }
+            if result.get("action") == "regenerate" and new_plan.get("drawing_prompt"):
+                resp["enhanced_prompt"] = new_plan["drawing_prompt"]
+            return JSONResponse(resp)
         else:
             # Label-only or style-only edits — just re-render
             annotated_url = None

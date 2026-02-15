@@ -1,6 +1,6 @@
 # Medical Figure Generator
 
-A chat-based tool for generating labeled medical and scientific textbook-style figures. It combines LLM-driven diagram planning, cloud image generation APIs (Gemini Imagen / DALL-E 3), vision-model label placement, and Pillow/SVG rendering — all orchestrated through a FastAPI web interface with iterative refinement.
+A chat-based tool for generating labeled medical and scientific textbook-style figures. It combines LLM-driven diagram planning, cloud image generation APIs (Gemini Imagen / DALL-E 3) with embedded numbered placeholders, OCR-based placeholder detection, and Pillow/SVG rendering — all orchestrated through a FastAPI web interface with iterative refinement.
 
 ---
 
@@ -17,11 +17,11 @@ User Message
 └──────────┬───────────────┘
            ▼
 ┌──────────────────────────┐
-│ 2. Image Generator       │  Gemini Imagen or DALL-E 3 produces a clean raster PNG
+│ 2. Image Generator       │  Gemini/DALL-E produces raster PNG with numbered placeholders (1,2,3...)
 └──────────┬───────────────┘
            ▼
 ┌──────────────────────────┐
-│ 3. Vision Label Placer   │  2-pass zone-classification via Vision LLM locates structures
+│ 3. Placeholder OCR       │  EasyOCR detects placeholder positions; vision API fallback if needed
 └──────────┬───────────────┘
            ▼
 ┌──────────────────────────┐
@@ -36,9 +36,9 @@ User Message
 
 ### Key Design Decisions
 
-- **No local GPU required.** All heavy lifting (image generation, vision analysis) uses cloud APIs.
-- **Positive-only image prompts.** The planner writes purely descriptive prompts (no prohibitions). A regex safety net strips any negations before the prompt reaches the image model, preventing "attention to forbidden concepts" artifacts.
-- **Classification over regression.** Vision models are poor at estimating exact pixel coordinates. The label placer converts coordinate estimation into a two-pass classification task using numbered zone overlays, which VLMs handle reliably.
+- **No local GPU required.** All heavy lifting (image generation, OCR) uses cloud APIs and local EasyOCR.
+- **Placeholder-embedded generation.** The image model draws numbered markers (1, 2, 3, ...) directly on the illustration at each structure. OCR detects their positions; placeholders are then covered and replaced with real labels.
+- **OCR + vision fallback.** EasyOCR locates placeholder numbers. If detection is insufficient (<50%), the pipeline falls back to a single vision API call for structure positions.
 - **Hybrid intent classification.** The refiner uses 23+ deterministic regex patterns before falling back to an LLM, ensuring fast and reliable intent routing for common refinement requests.
 
 ### Project Structure
@@ -55,7 +55,7 @@ medical-figure-gen/
 │   ├── __init__.py
 │   ├── diagram_planner.py        # Stage 1 — LLM plan generation + auditor loop
 │   ├── image_generator.py        # Stage 2 — Cloud image generation (Gemini / OpenAI)
-│   ├── vision_label_placer.py    # Stage 3 — 2-pass zone-classification label placement
+│   ├── placeholder_ocr.py        # Stage 3 — OCR-based placeholder detection (vision fallback)
 │   ├── label_renderer.py         # Stage 4 — Pillow PNG + SVG annotation rendering
 │   ├── refiner.py                # Stage 5 — Multi-action refinement router
 │   └── utils.py                  # Shared utilities (retry decorator, etc.)
@@ -161,7 +161,7 @@ All settings live in [config.py](config.py):
 | `LLM_PROVIDER` | `"gemini"` | LLM for planning, vision, & refinement (`"gemini"` or `"openai"`) |
 | `IMAGE_GEN_PROVIDER` | `"gemini"` | Image generation API (`"gemini"` or `"openai"`) |
 | `GEMINI_LLM_MODEL` | `"gemini-2.0-flash"` | Gemini model for text & vision tasks |
-| `GEMINI_IMAGE_MODEL` | `"gemini-2.0-flash-exp-image-generation"` | Gemini model for image generation |
+| `GEMINI_IMAGE_MODEL` | `"nano-banana-pro-preview"` | Gemini model for image generation |
 | `OPENAI_IMAGE_MODEL` | `"dall-e-3"` | OpenAI image model |
 | `OPENAI_LLM_MODEL` | `"gpt-4o"` | OpenAI text & vision model |
 | `DEFAULT_LABEL_STYLE` | `"boxed_text"` | Default annotation style |
@@ -201,7 +201,7 @@ All settings live in [config.py](config.py):
   "steps": [
     { "stage": "diagram_planner", "result": { "labels": 12, "type": "anatomy" } },
     { "stage": "image_generator", "result": "/generated/a1b2c3d4/raster.png" },
-    { "stage": "vision_label_placer", "result": "Located 12 labels" },
+    { "stage": "placeholder_ocr", "result": "Detected 12 label positions via OCR" },
     { "stage": "label_renderer", "result": "boxed_text style, 12 labels" }
   ],
   "raster_url": "/generated/a1b2c3d4/raster.png",
@@ -259,24 +259,19 @@ Calls the configured image API (Gemini Imagen or DALL-E 3) with the drawing prom
 
 Before sending, the generator:
 1. **Strips negations** via regex — removes any "do not", "no text", etc. the planner may have included
-2. **Appends a short suffix** — `". Single illustration, pure visual artwork, no text."` (minimal, effective)
+2. **Appends placeholder instruction** — asks for small circled numbers (1, 2, 3, ... N) at each anatomical structure. If no labels in plan, uses "no text, no labels" suffix instead.
 3. **Saves** the result as `raster.png` (1024×1024)
 
-### Stage 3 — Vision Label Placer (`pipeline/vision_label_placer.py`)
+### Stage 3 — Placeholder OCR (`pipeline/placeholder_ocr.py`)
 
-Locates where each anatomical structure appears in the generated image using a **two-pass zone-classification** approach:
+Locates label positions by detecting the numbered placeholders embedded in the generated image:
 
-**Pass 1 — Coarse (zone identification):**
-- Overlays an N×N grid of **numbered zones** (red circles with white numbers) onto the image
-- Asks the vision model: *"Which zone number contains each structure?"* — a classification task
-- Grid size adapts to label count (e.g., 5×5 = 25 zones for 12 labels)
+1. **OCR detection** — EasyOCR (with `allowlist='0123456789'`) finds all digits and their bounding boxes in the image
+2. **Mapping** — Each detected number N maps to `labels[N-1]`; bbox center becomes the leader-line target point
+3. **Cover regions** — Bounding boxes are stored for covering placeholders before drawing real labels
+4. **Vision fallback** — If OCR detects fewer than 50% of expected numbers, a single vision API call extracts structure positions instead
 
-**Pass 2 — Fine (sub-cell localisation):**
-- For each occupied zone, crops that region and overlays a **3×3 lettered grid** (A–I)
-- Asks the vision model: *"Which sub-cell contains the center of the structure?"*
-- Maps zone + sub-cell back to full-image pixel coordinates
-
-This approach yields ~67px precision on a 1024×1024 image and guarantees structures in different zones get different coordinates — solving the "everything clusters at center" problem that plagued direct pixel-coordinate estimation.
+The label renderer then covers placeholder regions (with background-colored ellipses) and draws real labels with leader lines.
 
 ### Stage 4 — Label Renderer (`pipeline/label_renderer.py`)
 
@@ -312,9 +307,9 @@ Supported actions:
 | `style_change` | Re-renders labels with new style (no API calls) |
 | `label_edit` | Modifies label text, re-renders |
 | `remove_label` | Removes a label, re-renders |
-| `add_label` | Adds label to plan, re-runs vision placer + renderer |
-| `reposition_labels` | Re-runs vision placer on existing image |
-| `regenerate` | Re-runs full pipeline (planner → image gen → vision → render) |
+| `add_label` | Adds label to plan, re-runs placeholder OCR + renderer |
+| `reposition_labels` | Re-runs placeholder OCR on existing image |
+| `regenerate` | Re-runs full pipeline (planner → image gen → OCR → render) |
 
 ---
 
@@ -325,7 +320,7 @@ Supported actions:
 | `conda activate` doesn't work in VS Code terminal | Use full Python path: `C:\Users\...\anaconda3\envs\svgrender\python.exe` |
 | "Gemini did not return an image" | The model may not support your prompt. Try `IMAGE_GEN_PROVIDER=openai` |
 | Image has multiple panels / collage | Check that `_NEGATION_RE` in `image_generator.py` is stripping prohibitions. The planner prompt should produce only positive descriptions |
-| Labels all cluster at center | Ensure `vision_label_placer.py` is using the 2-pass zone approach (check server logs for "Pass 1: NxN zone grid") |
+| Labels misplaced or missing | Check that image model drew placeholders; OCR logs show "Detected N/M placeholders". Install EasyOCR: `pip install easyocr` |
 | Rate limit errors (429) | Built-in retry with exponential backoff handles this. Reduce request frequency or check API quotas |
 | Font not found on Linux/macOS | Set `FONT_PATH` and `FONT_BOLD_PATH` in `.env` to valid TTF paths |
 
@@ -337,7 +332,7 @@ To add a new LLM or image generation provider:
 
 1. Add the API key to `.env` and `config.py`
 2. Add a new branch in the relevant pipeline file:
-   - **LLM tasks:** `diagram_planner.py`, `vision_label_placer.py`, `refiner.py`
+   - **LLM tasks:** `diagram_planner.py`, `placeholder_ocr.py` (vision fallback), `refiner.py`
    - **Image generation:** `image_generator.py`
 3. Add the provider name to `IMAGE_GEN_PROVIDER` / `LLM_PROVIDER` options
 

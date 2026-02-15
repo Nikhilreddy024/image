@@ -115,6 +115,20 @@
         .msg .step-list .fail::before { content: "✗ "; color: #dc3545; }
         .msg .step-list .pending::before { content: "⏳ "; }
 
+        .msg .enhanced-prompt {
+            display: block;
+            width: 100%;
+            max-width: 100%;
+            margin-top: 6px;
+            padding: 8px;
+            font-size: 12px;
+            font-family: inherit;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            background: #f9f9f9;
+            resize: vertical;
+        }
+
         .input-area {
             padding: 12px;
             border-top: 1px solid #eee;
@@ -315,7 +329,8 @@
                 <label>
                     Labels:
                     <select id="labelStyle">
-                        <option value="boxed_text" selected>Boxed Labels</option>
+                        <option value="professional" selected>Professional</option>
+                        <option value="boxed_text">Boxed Labels</option>
                         <option value="plain_text">Plain Text</option>
                         <option value="numbered">Numbered</option>
                         <option value="color_coded">Color-Coded</option>
@@ -361,6 +376,12 @@
         const messagesEl = document.getElementById('messages');
         const inputEl = document.getElementById('userInput');
         const sendBtn = document.getElementById('sendBtn');
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
 
         // Auto-resize textarea
         inputEl.addEventListener('input', () => {
@@ -511,6 +532,9 @@
                 statusMsg.className = 'msg assistant';
                 statusMsg.innerHTML = `Figure generated! Session: <b>${data.session_id}</b>${stepsHtml}`;
 
+                if (data.enhanced_prompt) {
+                    addMessage(`<strong>Enhanced prompt:</strong><br><textarea readonly class="enhanced-prompt" rows="6">${escapeHtml(data.enhanced_prompt)}</textarea>`, 'assistant');
+                }
                 if (data.plan) {
                     const labels = (data.plan.labels || []).join(', ');
                     if (labels) {
@@ -559,6 +583,10 @@
 
                 statusMsg.className = 'msg assistant';
                 statusMsg.innerHTML = `${data.explanation} <small>(${data.action})</small>`;
+
+                if (data.enhanced_prompt) {
+                    addMessage(`<strong>Enhanced prompt:</strong><br><textarea readonly class="enhanced-prompt" rows="6">${escapeHtml(data.enhanced_prompt)}</textarea>`, 'assistant');
+                }
 
                 // Cache-bust: append timestamp so browser fetches the new image
                 const ts = '?t=' + Date.now();
