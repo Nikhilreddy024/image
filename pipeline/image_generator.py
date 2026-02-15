@@ -2,6 +2,9 @@
 Stage 2: Image Generator
 Takes structured prompt → generates raster PNG image via API.
 Supports Gemini Imagen and OpenAI DALL-E 3.
+
+The image is generated WITH numbered placeholder markers and leader lines/arrows
+baked in. The actual label text is replaced in a later post-processing step.
 """
 
 from __future__ import annotations
@@ -21,67 +24,69 @@ from config import (
 from pipeline.utils import retry_on_rate_limit
 
 
-# Regex to strip text/label-related negative phrases the planner may have leaked.
-# IMPORTANT: This is intentionally narrow — we only strip phrases that prohibit text,
-# labels, numbers, or annotations. We keep style negations like "no gradients" since
-# those are valid artistic instructions for the image gen model.
-_TEXT_NEGATION_RE = re.compile(
-    r"(?i)"
-    r"(\b(do not|don'?t|never|must not|should not|cannot|absolutely no|strictly no)\b"
-    r"[^.;]*(text|label|number|annotation|caption|leader\s*line|letter|word)[^.;]*[.;]?\s*)",
-)
-
-
-def _build_clean_image_suffix(labels: list[str]) -> str:
+def _build_placeholder_suffix(labels: list[str]) -> str:
     """
-    Build a suffix that ensures the image is a clean illustration with NO text/numbers.
-    Labels are overlaid programmatically later by the label renderer, so the base image
-    must be pristine.  We DO hint at which structures should be visually distinct so the
-    vision-based label placer can locate them afterward.
+    Build a suffix that reinforces the numbered placeholder annotation instructions.
+    The image model renders numbered markers (1, 2, 3…) with leader lines pointing
+    to each anatomical structure.  The actual label text is swapped in post-processing.
     """
     if not labels:
         return (
-            ". Single illustration, pure visual artwork. "
-            "Absolutely no text, no letters, no numbers, no labels, no annotations anywhere on the image."
+            ". Single illustration in professional medical textbook style. "
+            "Include only the anatomical artwork with clean visual hierarchy."
         )
-    # Build a short hint listing key structures that should be visually distinguishable
-    structure_hint = ", ".join(labels[:20])  # cap for prompt-length sanity
+
+    n = len(labels)
+    marker_list = ", ".join(str(i + 1) for i in range(n))
+    # Build the marker-to-structure mapping for the image model
+    mapping_lines = "\n".join(
+        f"  {i + 1} → {lbl}" for i, lbl in enumerate(labels)
+    )
+
     return (
-        f". Ensure the following structures are clearly and distinctly drawn so they can "
-        f"be individually identified: {structure_hint}. "
-        "Each structure must have clear visual boundaries and distinct coloring or shading. "
-        "CRITICAL: Do NOT place any text, letters, numbers, labels, annotations, leader lines, "
-        "or captions anywhere on the image. The image must be a completely clean illustration "
-        "with zero text of any kind."
+        f"\n\nANNOTATION INSTRUCTIONS (critical):\n"
+        f"Include exactly {n} numbered annotation markers ({marker_list}) in the illustration.\n"
+        f"Each marker is a clearly visible, bold number placed in the margin areas of the image.\n"
+        f"Connect each marker to its corresponding anatomical structure with a clean, thin "
+        f"leader line or arrow.\n\n"
+        f"Marker-to-structure mapping:\n{mapping_lines}\n\n"
+        f"IMPORTANT RULES:\n"
+        f"- Render ONLY the number at each marker position. Do NOT write out the label text.\n"
+        f"- Place markers in margin columns (left/right sides) with ample space around each.\n"
+        f"- Leader lines should be thin, dark, and professional — no crossing.\n"
+        f"- Leave generous empty space around each marker number for text to be added later.\n"
+        f"- The final result should look like a professional medical textbook figure with "
+        f"numbered annotations."
     )
 
 
 def generate_image(spec: dict, session_id: str, provider: str | None = None) -> Path:
     """
-    Generate a clean raster image from the structured spec.
-    The image will contain NO text, numbers, or annotations — those are added
-    programmatically later by the label renderer after the vision-based label
-    placer locates each structure.
+    Generate a raster image WITH numbered placeholder markers and leader lines.
+    The model renders both the illustration and the annotation markers/arrows in
+    a single pass.  Placeholder numbers are replaced with real label text later
+    by the placeholder replacer.
 
     Args:
-        spec: dict from prompt_structurer with 'drawing_prompt' and optionally 'labels'
+        spec: dict from diagram planner with 'drawing_prompt' and 'labels'
         session_id: unique ID for this generation session
         provider: 'gemini' or 'openai' (overrides config default)
 
     Returns:
-        Path to the saved PNG image
+        Path to the saved PNG image (with numbered placeholders baked in)
     """
     provider = provider or IMAGE_GEN_PROVIDER
 
     labels = spec.get("labels") or []
-    clean_suffix = _build_clean_image_suffix(labels)
+    placeholder_suffix = _build_placeholder_suffix(labels)
 
-    # Clean the drawing prompt: strip any negative/prohibition phrases and append suffix
+    # Use the drawing prompt as-is (it already contains annotation instructions
+    # from the planner) and reinforce with the placeholder suffix.
     raw_prompt = spec["drawing_prompt"]
-    cleaned = _TEXT_NEGATION_RE.sub("", raw_prompt).strip()
-    cleaned = re.sub(r"  +", " ", cleaned)
+    # Normalise whitespace only — do NOT strip annotation/text instructions
+    cleaned = re.sub(r"  +", " ", raw_prompt).strip()
     cleaned = re.sub(r"\.\.+", ".", cleaned)
-    prompt = cleaned + clean_suffix
+    prompt = cleaned + placeholder_suffix
     print(f"[image_gen] Prompt ({len(prompt)} chars): {prompt[:120]}...")
 
     if provider == "gemini":

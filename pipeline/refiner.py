@@ -31,9 +31,7 @@ from config import (
     LLM_PROVIDER, GEMINI_LLM_MODEL, OPENAI_LLM_MODEL,
     GENERATED_DIR,
 )
-from pipeline.label_renderer import (
-    compute_label_layout, render_labels_on_png, render_labels_as_svg,
-)
+from pipeline.placeholder_replacer import detect_and_replace
 
 
 # ─── Deterministic Intent Patterns ───────────────────────────────────
@@ -197,6 +195,8 @@ class RefineSession:
             }
 
         elif action == "remove_label":
+            # Since annotation arrows are baked into the image, removing a label
+            # requires regeneration to update the numbered markers and leader lines.
             changes = classification.get("changes", [])
             for change in changes:
                 target = change.get("target", "")
@@ -210,19 +210,16 @@ class RefineSession:
                         if pos["label"].lower() != target.lower()
                     ]
 
-            png_path, svg_path = self._re_render(self.label_style)
             result = {
                 "action": "remove_label",
-                "explanation": explanation,
-                "needs_regeneration": False,
-                "annotated_png": png_path,
-                "annotated_svg": svg_path,
+                "explanation": explanation + " Regenerating image without the removed label marker.",
+                "needs_regeneration": True,
+                "new_plan": _build_refined_plan(self.plan, request),
             }
 
         elif action == "add_label":
-            # Adding a label requires re-running the vision placer
-            # to find the position of the new anatomical part.
-            # Signal this as a regeneration-like operation.
+            # Adding a label requires full regeneration since the AI model
+            # needs to place a new numbered marker with a leader line.
             changes = classification.get("changes", [])
             for change in changes:
                 new_label = change.get("value", "")
@@ -231,20 +228,19 @@ class RefineSession:
 
             result = {
                 "action": "add_label",
-                "explanation": explanation + " Re-running vision analysis for new label positions.",
+                "explanation": explanation + " Regenerating image with new annotation marker.",
                 "needs_regeneration": True,
-                "needs_vision_rerun": True,
-                "new_plan": self.plan,
+                "new_plan": _build_refined_plan(self.plan, request),
             }
 
         elif action == "reposition_labels":
-            # Labels are in wrong places — re-run vision model on existing image
+            # Arrows and leader lines are baked into the image, so repositioning
+            # requires full regeneration with the AI model re-deciding layout.
             result = {
                 "action": "reposition_labels",
-                "explanation": "Re-analyzing the image to find correct label positions.",
-                "needs_regeneration": False,
-                "needs_vision_rerun": True,
-                "new_plan": self.plan,
+                "explanation": "Regenerating image — the AI model will re-decide label positions and arrow layout.",
+                "needs_regeneration": True,
+                "new_plan": _build_refined_plan(self.plan, request),
             }
 
         else:
@@ -259,40 +255,27 @@ class RefineSession:
         return result
 
     def _re_render(self, style: str) -> tuple[Path, Path]:
-        """Re-render labels with current positions and the given style."""
+        """Re-render labels by re-running placeholder replacement on the raster.
+
+        Since the new pipeline bakes arrows/leader lines into the raster image
+        during generation, label-only edits (rename, remove, style change) are
+        handled by re-detecting markers and replacing with updated label text.
+        """
         raster_path = GENERATED_DIR / self.session_id / "raster.png"
 
-        from PIL import Image
-        with Image.open(raster_path) as img:
-            w, h = img.size
+        # Build labels list from current label_positions
+        labels = [p["label"] for p in self.label_positions]
 
-        # Professional style uses balanced left/right distribution
-        effective_label_side = self.plan.get("label_side", "right")
-        if style == "professional":
-            effective_label_side = "integrated"
+        if not labels:
+            # Nothing to render
+            return raster_path, raster_path
 
-        # Recompute layout in case labels changed
-        label_positions = compute_label_layout(
-            points=self.label_positions,
-            image_width=w,
-            image_height=h,
-            label_side=effective_label_side,
-        )
-        self.label_positions = label_positions
-
-        png_path = render_labels_on_png(
+        png_path, svg_path, new_positions = detect_and_replace(
             image_path=raster_path,
-            label_positions=label_positions,
-            style=style,  # type: ignore[arg-type]
-            session_id=self.session_id,
-            cover_placeholders=False,  # Clean images: no placeholders to cover
-        )
-        svg_path = render_labels_as_svg(
-            image_path=raster_path,
-            label_positions=label_positions,
-            style=style,  # type: ignore[arg-type]
+            labels=labels,
             session_id=self.session_id,
         )
+        self.label_positions = new_positions
         return png_path, svg_path
 
 

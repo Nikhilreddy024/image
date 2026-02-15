@@ -19,57 +19,68 @@ from config import (
 from pipeline.utils import retry_on_rate_limit
 
 
-ENHANCE_PROMPT_SYSTEM = """You are a creative scientific illustration specialist for medical/biomedical textbook figures. Your role is to transform brief user descriptions into rich, vivid prompts that inspire high-quality image generation.
+ENHANCE_PROMPT_SYSTEM = """You are a creative scientific illustration specialist for medical/biomedical textbook figures. Your role is to transform brief user descriptions into rich, vivid prompts that inspire high-quality annotated image generation.
 
-Given a user's short description, produce a single enhanced, creative prompt suitable for an image generation model. Your output will be used ONLY to generate the base illustration — no labels or text will be requested at this stage.
+Given a user's short description, produce a single enhanced, creative prompt suitable for an image generation model. The image model will generate a FULLY ANNOTATED illustration — both the artwork and the annotation markers/arrows in a single pass.
 
 Requirements for the enhanced prompt:
-- Be vivid and evocative: describe style (flat vector, textbook, white background), anatomical subject, view (e.g. palmar, lateral, cross-section), lighting feel, and key structures with visual clarity.
-- Use positive descriptions only (what to draw), no negative phrases (e.g. avoid "no text", "no labels").
-- Add creative depth: consider composition, visual hierarchy, spatial relationships, and color semantics (e.g. nerves as yellow, vessels as red, bone as cream).
-- ALWAYS include a legend placeholder: describe a dedicated, clearly delineated area (e.g. bottom-right corner, bottom strip, side panel) reserved for a legend/key. Use phrases like "reserved legend area", "empty legend panel", or "dedicated legend space" — the legend content will be added programmatically later; you only describe the visual space for it.
-- Vary your language: avoid generic phrasing; choose precise anatomical and stylistic terms that bring the diagram to life.
-- Keep it concise but comprehensive (roughly 100–250 words).
+- Be vivid and evocative: describe style (flat vector, textbook, white background), anatomical subject, view (e.g. palmar, lateral, cross-section), and key structures with visual clarity.
+- INCLUDE annotation layout instructions: describe numbered placeholder markers (1, 2, 3, …) connected to key structures via clean leader lines or arrows, placed in clear margin columns or annotation areas.
+- Describe the annotation aesthetic: thin black or dark-gray leader lines, small circled or bold numbers, professional textbook annotation style matching the reference of high-quality medical atlases.
+- Add creative depth: composition, visual hierarchy, spatial relationships, color semantics (nerves as yellow, vessels as red, bone as cream).
+- ALWAYS include a legend area: a clearly delineated region (e.g. bottom-right panel, side box) reserved for a color-coded legend/key.
+- IMPORTANT: Markers should display ONLY the number (1, 2, 3…) — NOT the descriptive label text. The actual label text will be added in post-processing.
+- Vary your language; choose precise anatomical and stylistic terms.
+- Keep it concise but comprehensive (roughly 150–300 words).
 - Do NOT output a list of labels or any JSON — output only the enhanced prompt text, nothing else."""
 
 
 PLANNER_SYSTEM_PROMPT = """You are a scientific illustration planner for medical/biomedical textbook figures.
 
-Given a user's description, produce a JSON diagram plan with these fields:
+Given a user's description, produce a JSON diagram plan. The image generation model will render BOTH the illustration AND numbered annotation markers with leader lines in a single pass — matching the style of professional medical atlases.
 
-1. "drawing_prompt": A comprehensive, structured prompt for medical illustration generation.
-   CRITICAL: The drawing_prompt describes ONLY the illustration itself. Do NOT ask for labels, text, annotations, or leader lines — these are added programmatically later. The base image must be a clean illustration with no text.
+Fields:
+
+1. "drawing_prompt": A comprehensive prompt for generating a fully annotated medical illustration.
+   The model must render the illustration AND numbered placeholder annotations together.
    STRUCTURE:
    - Begin with "Style Preface:" describing the visual foundation:
-     * Strictly flat, clean vector medical illustration in professional textbook style
-     * Solid white background, no gradients, no soft shading, no pseudo-3D effects
-     * Uniform medium-weight black outlines throughout
+     * Professional medical textbook illustration style
+     * Solid white background, clean lines, publication-quality rendering
      * Muted, desaturated color palette: flat beige for skin, muted reddish-brown for muscle, off-white/cream for bone
-   
-   - Follow with "Main Content:" describing the anatomical subject with vivid, precise visual language:
-     * Multiple side-by-side diagrams if showing different layers/systems (e.g., Skin, Muscle, Bone)
-     * Each diagram showing specific anatomical structures with distinct outlines and clear spatial relationships
-     * Creative color semantics: yellow for nerves, red for arteries/vessels, cream for bone, muted tones for soft tissue
-     * Describe structures as visual elements (e.g. phalanges, metacarpals, muscle groups) — NOT as labels
-   
-   - Include "Right Column Insets:" or "Legend & Insets:" if applicable:
-     * Cross-sectional views, surface landmarks
-     * MANDATORY: A clearly delineated legend/key area — describe its placement (e.g. bottom-right panel, bottom strip, side box) with visual boundaries (border, background panel) so the illustration has a dedicated space for the legend. Do not include legend text or content — only the empty reserved area.
-   
-   - End with "Crucial Constraints:" balanced composition, ample white space, and creative visual hierarchy
-   
-   Maximum 300 words. Write ONLY positive visual descriptions. ALWAYS include a dedicated legend area. NEVER include labels, text, annotations, or leader lines in the drawing_prompt.
+     * Uniform medium-weight black outlines on anatomical structures
 
-2. "labels": An array of anatomical/scientific terms that will be rendered as annotations.
+   - Follow with "Main Content:" describing the anatomical subject:
+     * Multiple panels if showing different layers/systems (e.g., Skin, Muscle, Bone)
+     * Precise anatomical structures with distinct visual features
+     * Color semantics: yellow for nerves, red for arteries/vessels, cream for bone
+
+   - CRITICAL — "Annotations:" section describing numbered placeholder markers:
+     * Include numbered markers (1, 2, 3, …) with clean, thin leader lines or arrows pointing to each anatomical structure
+     * Markers should be bold numbers (optionally circled or in small boxes) placed in clear margin areas or annotation columns
+     * Leader lines should be thin, dark, professional — straight or elbow-routed, never crossing each other
+     * Markers should be well-spaced and arranged in columns along the left or right margins, or distributed around the illustration
+     * Provide the FULL marker-to-structure mapping in the prompt so the model knows which number points to which structure
+     * IMPORTANT: Render ONLY the number at each marker position — NOT the descriptive label text. The real label text is added in post-processing.
+     * Leave generous space around each marker for text replacement
+
+   - Include "Insets & Legend:" if applicable:
+     * Cross-sections, surface landmarks, detail views
+     * A clearly bordered legend/key area with color-coded entries
+
+   - End with "Layout Constraints:" balanced composition, ample white space, clear visual hierarchy, no overlapping annotations
+
+   Maximum 400 words.
+
+2. "labels": Array of anatomical/scientific terms. labels[0] maps to marker 1, labels[1] to marker 2, etc.
    - Order logically by anatomical position or system hierarchy
    - 5-30 labels depending on complexity
-   - Group related structures together
 
-3. "label_side": "right" (default), "left", "integrated" (for multi-panel with labels within each), or "legend_based".
+3. "label_side": "right", "left", "integrated" (markers distributed around the illustration), or "both_sides".
 
 4. "style": One of: "multi_panel_system", "layered_anatomy", "cross_section", "comparative_view", "single_structure".
 
-5. "description": 1-2 sentence summary of the complete figure including all panels and insets.
+5. "description": 1-2 sentence summary of the complete figure.
 
 6. "diagram_type": "anatomy" or "relational".
 
@@ -78,11 +89,11 @@ Respond ONLY with valid JSON. No markdown, no code fences.
 Example input: "draw a human hand anatomy"
 Example output:
 {
-  "drawing_prompt": "Style Preface: A strictly flat, clean vector medical illustration in a professional textbook style, set against a solid white background. No gradients, no soft shading, no pseudo-3D effects. All elements must have uniform medium-weight black outlines. The color palette must be muted and desaturated suitable for scientific publication: flat beige for skin, muted reddish-brown for muscle, off-white/cream for bone. Main Content: Three separate diagrams of the human hand (palmar view) arranged side-by-side. Left Diagram shows surface anatomy with flat color fill and distinct outlines including phalanges, MCP/PIP/DIP joints, palmar creases, thenar eminence, and hypothenar eminence as visual elements. Center Diagram illustrates muscle layers using flat muted reddish-brown colors: flexor digitorum superficialis and profundus, lumbricals, palmar aponeurosis, thenar and hypothenar muscle groups. Nerves shown as distinct flat yellow lines; arteries as flat red lines. Right Diagram shows skeletal structure in flat off-white: phalanges, metacarpals I-V, carpals, radius and ulna. Right Column Insets: Top right, carpal tunnel cross-section showing tendons, nerve, and ligament. Middle right, surface landmarks as a small flat outline hand. Legend Area: Bottom right, a clearly bordered rectangular panel or box reserved exclusively for a legend/key — empty, with a subtle outline or background to distinguish it from the main illustration. Crucial Constraints: Balanced composition with ample white space and clear visual hierarchy. Illustration only — no text, labels, or annotations.",
+  "drawing_prompt": "Style Preface: A professional medical textbook illustration in clean vector style, set against a solid white background. Muted, desaturated color palette: flat beige for skin, muted reddish-brown for muscle, off-white/cream for bone. Uniform medium-weight black outlines on all anatomical structures. Main Content: Three separate diagrams of the human hand (palmar view) arranged side-by-side. Left Diagram: surface anatomy with flat color fill showing phalanges, joints, palmar creases, thenar and hypothenar eminences. Center Diagram: muscle layer in muted reddish-brown showing flexor digitorum superficialis and profundus, lumbricals, palmar aponeurosis, thenar and hypothenar muscle groups. Nerves as flat yellow lines, arteries as flat red lines. Right Diagram: skeletal view in off-white showing phalanges, metacarpals I-V, carpals, radius and ulna. Insets & Legend: Top-right inset showing carpal tunnel cross-section. Middle-right inset showing surface landmarks. Bottom-right bordered legend panel with color-coded entries for tissue types. Annotations: Include numbered markers 1 through 17 with thin dark-gray leader lines pointing from the margin columns to each corresponding structure. Markers are bold numbers in small white circles placed along the left and right margins of each panel, well-spaced vertically. Marker mapping: 1→distal phalanx, 2→middle phalanx, 3→proximal phalanx, 4→MCP joint, 5→PIP joint, 6→DIP joint, 7→thenar eminence, 8→hypothenar eminence, 9→flexor digitorum superficialis, 10→flexor digitorum profundus, 11→lumbricals, 12→median nerve, 13→ulnar nerve, 14→metacarpals, 15→carpals, 16→radial artery, 17→ulnar artery. Render ONLY the number at each marker — not the label text. Layout Constraints: Balanced composition, ample white space, annotations must not overlap with anatomy or each other.",
   "labels": ["Distal phalanx", "Middle phalanx", "Proximal phalanx", "MCP joint", "PIP joint", "DIP joint", "Thenar eminence", "Hypothenar eminence", "Flexor digitorum superficialis", "Flexor digitorum profundus", "Lumbricals", "Median nerve", "Ulnar nerve", "Metacarpals", "Carpals", "Radial artery", "Ulnar artery"],
   "label_side": "integrated",
   "style": "multi_panel_system",
-  "description": "Comprehensive palmar view of human hand anatomy showing three side-by-side diagrams (Skin, Muscle, Bone) with right column insets for carpal tunnel cross-section, surface landmarks, and color legend.",
+  "description": "Comprehensive palmar view of human hand anatomy showing three side-by-side diagrams (Skin, Muscle, Bone) with right column insets for carpal tunnel cross-section, surface landmarks, and color legend, annotated with numbered markers.",
   "diagram_type": "anatomy"
 }"""
 
